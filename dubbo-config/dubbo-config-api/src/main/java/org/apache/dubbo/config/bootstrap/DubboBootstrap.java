@@ -155,6 +155,8 @@ public class DubboBootstrap extends GenericEventListener {
 
     private AtomicBoolean started = new AtomicBoolean(false);
 
+    private AtomicBoolean destroyed = new AtomicBoolean(false);
+
     private volatile ServiceInstance serviceInstance;
 
     private volatile MetadataService metadataService;
@@ -181,6 +183,7 @@ public class DubboBootstrap extends GenericEventListener {
         configManager = ApplicationModel.getConfigManager();
         environment = ApplicationModel.getEnvironment();
 
+        DubboShutdownHook.getDubboShutdownHook().register();
         ShutdownHookCallbacks.INSTANCE.addCallback(new ShutdownHookCallback() {
             @Override
             public void callback() throws Throwable {
@@ -189,8 +192,8 @@ public class DubboBootstrap extends GenericEventListener {
         });
     }
 
-    public void registerShutdownHook() {
-        DubboShutdownHook.getDubboShutdownHook().register();
+    public void unRegisterShutdownHook() {
+        DubboShutdownHook.getDubboShutdownHook().unregister();
     }
 
     private boolean isOnlyRegisterProvider() {
@@ -498,21 +501,17 @@ public class DubboBootstrap extends GenericEventListener {
             return;
         }
 
-        ApplicationModel.iniFrameworkExts();
+        ApplicationModel.initFrameworkExts();
 
         startConfigCenter();
 
         useRegistryAsConfigCenterIfNecessary();
-
-        startMetadataReport();
 
         loadRemoteConfigs();
 
         checkGlobalConfigs();
 
         initMetadataService();
-
-        initMetadataServiceExporter();
 
         initEventListener();
 
@@ -524,18 +523,51 @@ public class DubboBootstrap extends GenericEventListener {
     private void checkGlobalConfigs() {
         // check Application
         ConfigValidationUtils.validateApplicationConfig(getApplication());
-        // check Config Center
-        Collection<ConfigCenterConfig> configCenters = configManager.getConfigCenters();
-        if (CollectionUtils.isNotEmpty(configCenters)) {
-            for (ConfigCenterConfig configCenterConfig : configCenters) {
-                ConfigValidationUtils.validateConfigCenterConfig(configCenterConfig);
-            }
-        }
+
         // check Metadata
         Collection<MetadataReportConfig> metadatas = configManager.getMetadataConfigs();
-        for (MetadataReportConfig metadataReportConfig : metadatas) {
-            ConfigValidationUtils.validateMetadataConfig(metadataReportConfig);
+        if (CollectionUtils.isEmpty(metadatas)) {
+            MetadataReportConfig metadataReportConfig = new MetadataReportConfig();
+            metadataReportConfig.refresh();
+            if (metadataReportConfig.isValid()) {
+                configManager.addMetadataReport(metadataReportConfig);
+                metadatas = configManager.getMetadataConfigs();
+            }
         }
+        if (CollectionUtils.isNotEmpty(metadatas)) {
+            for (MetadataReportConfig metadataReportConfig : metadatas) {
+                metadataReportConfig.refresh();
+                ConfigValidationUtils.validateMetadataConfig(metadataReportConfig);
+            }
+        }
+
+        // check Provider
+        Collection<ProviderConfig> providers = configManager.getProviders();
+        if (CollectionUtils.isEmpty(providers)) {
+            configManager.getDefaultProvider().orElseGet(() -> {
+                ProviderConfig providerConfig = new ProviderConfig();
+                configManager.addProvider(providerConfig);
+                providerConfig.refresh();
+                return providerConfig;
+            });
+        }
+        for (ProviderConfig providerConfig : configManager.getProviders()) {
+            ConfigValidationUtils.validateProviderConfig(providerConfig);
+        }
+        // check Consumer
+        Collection<ConsumerConfig> consumers = configManager.getConsumers();
+        if (CollectionUtils.isEmpty(consumers)) {
+            configManager.getDefaultConsumer().orElseGet(() -> {
+                ConsumerConfig consumerConfig = new ConsumerConfig();
+                configManager.addConsumer(consumerConfig);
+                consumerConfig.refresh();
+                return consumerConfig;
+            });
+        }
+        for (ConsumerConfig consumerConfig : configManager.getConsumers()) {
+            ConfigValidationUtils.validateConsumerConfig(consumerConfig);
+        }
+
         // check Monitor
         ConfigValidationUtils.validateMonitorConfig(getMonitor());
         // check Metrics
@@ -549,11 +581,24 @@ public class DubboBootstrap extends GenericEventListener {
     private void startConfigCenter() {
         Collection<ConfigCenterConfig> configCenters = configManager.getConfigCenters();
 
+        // check Config Center
+        if (CollectionUtils.isEmpty(configCenters)) {
+            ConfigCenterConfig configCenterConfig = new ConfigCenterConfig();
+            configCenterConfig.refresh();
+            if (configCenterConfig.isValid()) {
+                configManager.addConfigCenter(configCenterConfig);
+                configCenters = configManager.getConfigCenters();
+            }
+        } else {
+            for (ConfigCenterConfig configCenterConfig : configCenters) {
+                configCenterConfig.refresh();
+                ConfigValidationUtils.validateConfigCenterConfig(configCenterConfig);
+            }
+        }
+
         if (CollectionUtils.isNotEmpty(configCenters)) {
             CompositeDynamicConfiguration compositeDynamicConfiguration = new CompositeDynamicConfiguration();
             for (ConfigCenterConfig configCenter : configCenters) {
-                configCenter.refresh();
-                ConfigValidationUtils.validateConfigCenterConfig(configCenter);
                 compositeDynamicConfiguration.addConfiguration(prepareEnvironment(configCenter));
             }
             environment.setDynamicConfiguration(compositeDynamicConfiguration);
@@ -611,10 +656,14 @@ public class DubboBootstrap extends GenericEventListener {
                     }
                     cc.getParameters().put(CLIENT_KEY, registryConfig.getClient());
                     cc.setProtocol(registryConfig.getProtocol());
+                    cc.setPort(registryConfig.getPort());
                     cc.setAddress(registryConfig.getAddress());
                     cc.setNamespace(registryConfig.getGroup());
                     cc.setUsername(registryConfig.getUsername());
                     cc.setPassword(registryConfig.getPassword());
+                    if (registryConfig.getTimeout() != null) {
+                        cc.setTimeout(registryConfig.getTimeout().longValue());
+                    }
                     cc.setHighestPriority(false);
                     configManager.addConfigCenter(cc);
                 });
@@ -660,13 +709,8 @@ public class DubboBootstrap extends GenericEventListener {
      * Initialize {@link MetadataService} from {@link WritableMetadataService}'s extension
      */
     private void initMetadataService() {
+        startMetadataReport();
         this.metadataService = getExtension(getMetadataType());
-    }
-
-    /**
-     * Initialize {@link MetadataServiceExporter}
-     */
-    private void initMetadataServiceExporter() {
         this.metadataServiceExporter = new ConfigurableMetadataServiceExporter(metadataService);
     }
 
@@ -851,7 +895,9 @@ public class DubboBootstrap extends GenericEventListener {
     }
 
     private void unexportMetadataService() {
-        metadataServiceExporter.unexport();
+        if (metadataServiceExporter != null && metadataServiceExporter.isExported()) {
+            metadataServiceExporter.unexport();
+        }
     }
 
     private void exportServices() {
@@ -987,7 +1033,12 @@ public class DubboBootstrap extends GenericEventListener {
     }
 
     public void destroy() {
-        if (started.compareAndSet(true, false)) {
+        // for compatibility purpose
+        DubboShutdownHook.destroyAll();
+
+        if (started.compareAndSet(true, false)
+                && destroyed.compareAndSet(false, true)) {
+
             unregisterServiceInstance();
             unexportMetadataService();
             unexportServices();
@@ -1003,10 +1054,21 @@ public class DubboBootstrap extends GenericEventListener {
         }
     }
 
+    /**
+     * Destroy all the protocols.
+     */
     private void destroyProtocols() {
-        configManager.getProtocols().forEach(protocolConfig -> {
-            ExtensionLoader.getExtensionLoader(Protocol.class).getExtension(protocolConfig.getName()).destroy();
-        });
+        ExtensionLoader<Protocol> loader = ExtensionLoader.getExtensionLoader(Protocol.class);
+        for (String protocolName : loader.getLoadedExtensions()) {
+            try {
+                Protocol protocol = loader.getLoadedExtension(protocolName);
+                if (protocol != null) {
+                    protocol.destroy();
+                }
+            } catch (Throwable t) {
+                logger.warn(t.getMessage(), t);
+            }
+        }
         if (logger.isDebugEnabled()) {
             logger.debug(NAME + "'s all ProtocolConfigs have been destroyed.");
         }
