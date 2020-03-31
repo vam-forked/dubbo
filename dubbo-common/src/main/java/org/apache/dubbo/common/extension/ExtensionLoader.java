@@ -74,6 +74,9 @@ import static org.apache.dubbo.common.constants.CommonConstants.REMOVE_VALUE_PRE
  * @see org.apache.dubbo.common.extension.SPI
  * @see org.apache.dubbo.common.extension.Adaptive
  * @see org.apache.dubbo.common.extension.Activate
+ *      维护class(插件接口) 与 ExtensionLoader 的关系：
+ *          1. 一个class 有一个 ExtensionLoader
+ *          2.
  */
 public class ExtensionLoader<T> {
 
